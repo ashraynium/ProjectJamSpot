@@ -1,769 +1,580 @@
-import os
-import pygame
 import math
-from typing import Dict, List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-from .models import NoteEvent
-from .utils import clamp
+import pygame
+
 from .audio_player import MidiAudioPlayer
+from .tab_converter import STANDARD_TUNING, TabEvent, build_guitar_tab, tab_statistics
+from .midi_mixer import build_mix
+from .midi_parser import MidiParser
+from .models import NoteEvent, PracticeOptions
+from .ui import FontBook, Theme, draw_card, draw_text
+from .utils import clamp, format_time
 
 
-# ============================================================
-# Pygame visualiser (modern layout + scrolling notes)
-# Hybrid: window-clipping + playline "hit" effects (Synthesia-ish)
-# ============================================================
+class PracticeView:
+    """Interactive practice screen shared by the drum, tab and piano modes."""
 
-class Visualiser:
-    def __init__(self, title: str, part_name: str, bpm: float, time_sig: str, key_sig: str,
-                 notes: List[NoteEvent], song_length: float, programs_by_channel: Dict[int, int]):
+    DRUM_ROWS = [
+        ("Kick", {35, 36}),
+        ("Snare", {38, 40}),
+        ("Clap", {39}),
+        ("Hi-hat", {42, 44, 46}),
+        ("Toms", {41, 43, 45, 47, 48, 50}),
+        ("Crash", {49, 57}),
+        ("Ride", {51, 59}),
+        ("Other", set(range(0, 128))),
+    ]
 
-        # Step 1: Init pygame
-        pygame.init()
-        pygame.display.set_caption("JamSpot")
-        self.screen = pygame.display.set_mode((1280, 760), pygame.RESIZABLE)
-        self.clock = pygame.time.Clock()
-
-        # Step 2: Store display data
+    def __init__(
+        self,
+        screen: pygame.Surface,
+        fonts: FontBook,
+        theme: Theme,
+        parser: MidiParser,
+        title: str,
+        options: PracticeOptions,
+        volume: int = 100,
+    ):
+        self.screen = screen
+        self.fonts = fonts
+        self.theme = theme
+        self.parser = parser
         self.title = title
-        self.part_name = part_name
-        self.bpm = bpm
-        self.time_sig = time_sig
-        self.key_sig = key_sig
-        self.notes = notes
-        self.song_length = song_length
-
-        # Step 3: Parse time signature (beat alignment)
-        self.ts_num = 4
-        self.ts_den = 4
-        try:
-            a, b = self.time_sig.split("/")
-            self.ts_num = int(a)
-            self.ts_den = int(b)
-            if self.ts_den <= 0:
-                self.ts_den = 4
-            if self.ts_num <= 0:
-                self.ts_num = 4
-        except:
-            self.ts_num, self.ts_den = 4, 4
-
-        # Step 4: Playback state
+        self.options = options
+        self.part = parser.parts_summary[options.target_part]
+        self.notes = list(parser.parts_notes[options.target_part])
+        self.song_length = parser.song_length_seconds
+        self.time_signature = parser.time_signatures[0] if parser.time_signatures else "4/4"
+        self.key_signature = parser.key_signatures[0] if parser.key_signatures else "Unknown"
+        self.bpm = parser.initial_bpm
+        self.speed = options.speed
+        self.mode = options.mode
         self.time = 0.0
+        self.previous_time = 0.0
         self.playing = False
-        self.prev_time = 0.0  # used for hit FX triggering
+        self.counting_in = False
+        self.count_in_remaining = 0.0
+        self.count_in_total = 0.0
+        self.count_in_last_beat = -1
+        self.metronome = options.metronome
+        self.loop_enabled = False
+        self.loop_a = 0.0
+        self.loop_b = self.song_length
+        self.elapsed_practice = 0.0
+        self.actions: List[Tuple[pygame.Rect, str]] = []
+        self.timeline_rect: Optional[pygame.Rect] = None
+        self.tab_events: List[TabEvent] = build_guitar_tab(
+            [note for note in self.notes if note.channel != 9]
+        )
 
-        # Step 5: Layout constants
-        self.top_h = 86
-        self.bottom_h = 96
-        self.playline_ratio = 0.30  # slightly left = more "play space"
-        self.lookahead_bars = 2
+        excluded = set() if options.include_target else {options.target_part}
+        audio_notes, programs = build_mix(parser, excluded_parts=excluded)
+        self.audio = MidiAudioPlayer(programs, volume=volume)
+        self.audio.load_notes(audio_notes)
 
-        # Step 6: Theme
-        self.COL_BG = (9, 11, 16)
-        self.COL_PANEL = (18, 22, 32)
-        self.COL_PANEL_2 = (24, 30, 42)
+        try:
+            numerator, denominator = self.time_signature.split("/")
+            self.beats_per_bar = max(1, int(numerator))
+            self.beat_unit = max(1, int(denominator))
+        except (ValueError, TypeError):
+            self.beats_per_bar = 4
+            self.beat_unit = 4
 
-        self.COL_TEXT = (235, 236, 240)
-        self.COL_TEXT_DIM = (165, 170, 182)
+    def set_screen(self, screen: pygame.Surface) -> None:
+        self.screen = screen
 
-        self.COL_BEAT = (40, 48, 62)
-        self.COL_BAR = (70, 85, 110)
-        self.COL_PLAYLINE = (245, 245, 245)
-
-        # Step 7: Fonts (tries assets/fonts; falls back)
-        self.font_ui = self._load_font("assets/fonts/ZalandoSansExpanded-Bold.ttf", 22, fallback=("arial", 22, True))
-        self.font_ui_small = self._load_font("assets/fonts/ZalandoSansExpanded-Bold.ttf", 16, fallback=("arial", 16, True))
-        self.font_mono = self._load_font("assets/fonts/RobotoMono-Regular.ttf", 16, fallback=("consolas", 16, False))
-        self.font_mono_small = self._load_font("assets/fonts/RobotoMono-Regular.ttf", 14, fallback=("consolas", 14, False))
-
-        # Step 8: Keep ALL notes for audio (drums can be tiny)
-        self.audio_notes = list(self.notes)
-        self.audio_notes.sort(key=lambda n: n.start_sec)
-
-        # Step 9: Filter tiny notes for drawing only (audio keeps everything)
-        self.min_note_seconds = 0.05
-        self.draw_notes = [n for n in self.notes if n.duration_sec >= self.min_note_seconds]
-        self.draw_notes.sort(key=lambda n: n.start_sec)
-
-        # Step 10: Detect drums + pitched
-        self.has_drums = any(n.channel == 9 for n in self.audio_notes)
-        self.has_pitched = any(n.channel != 9 for n in self.audio_notes)
-
-        # Step 11: Channel colors (multi-track)
-        self.channel_colors = self._build_channel_color_map(self.audio_notes)
-
-        # Step 12: Drum rows (kit lanes)
-        self.drum_rows = self._drum_rows()
-        self.drum_pitch_to_row = self._build_drum_pitch_map(self.drum_rows)
-
-        # Step 13: Shared label width (keeps drum/piano grids aligned)
-        self.roll_label_w = 150
-
-        # Step 14: Hit effects (Synthesia-ish, subtle)
-        # Each FX: {"t0": float, "kind": "piano"/"drum", "pitch": int, "channel": int, "color": (r,g,b)}
-        self.hit_fx: List[dict] = []
-
-        # Step 15: Note-on scan for FX (efficient triggering)
-        self.fx_scan_index = 0
-        self._resync_fx_index(self.time)
-
-        # Step 16: Precompute a stable piano pitch range (so FX Y mapping stays consistent)
-        self.piano_lo, self.piano_hi = self._compute_piano_pitch_range()
-
-        # Step 17: Audio
-        self.audio = MidiAudioPlayer(programs_by_channel)
-        self.audio.load_notes(self.audio_notes)
-
-    # --------------------------
-    # Project root + fonts
-    # --------------------------
-    def _project_root(self) -> str:
-        here = os.path.dirname(os.path.abspath(__file__))
-        return os.path.abspath(os.path.join(here, ".."))
-
-    def _load_font(self, rel_path: str, size: int, fallback=("arial", 16, False)):
-        root = self._project_root()
-        path = os.path.join(root, rel_path.replace("/", os.sep))
-        if os.path.exists(path):
-            try:
-                return pygame.font.Font(path, size)
-            except:
-                pass
-        name, _, bold = fallback
-        return pygame.font.SysFont(name, size, bold=bold)
-
-    # --------------------------
-    # Small UI helpers
-    # --------------------------
-    def _card(self, rect: pygame.Rect, color, radius=16):
-        shadow = rect.move(0, 5)
-        pygame.draw.rect(self.screen, (0, 0, 0), shadow, border_radius=radius)
-        pygame.draw.rect(self.screen, color, rect, border_radius=radius)
-
-    def _chip(self, x: int, y: int, text: str, col_bg=None):
-        col_bg = col_bg if col_bg else self.COL_PANEL_2
-        pad_x, pad_y = 12, 7
-        surf = self.font_mono_small.render(text, True, self.COL_TEXT_DIM)
-        w, h = surf.get_size()
-        r = pygame.Rect(x, y, w + pad_x * 2, h + pad_y * 2)
-        pygame.draw.rect(self.screen, col_bg, r, border_radius=999)
-        self.screen.blit(surf, (x + pad_x, y + pad_y))
-        return r.right + 10
-
-    def _fmt_time(self, t: float) -> str:
-        m = int(t // 60)
-        s = int(t % 60)
-        return f"{m:02d}:{s:02d}"
-
-    # --------------------------
-    # Timing helpers
-    # --------------------------
     def beat_seconds(self) -> float:
-        quarter = 60.0 / max(1.0, self.bpm)
-        return quarter * (4.0 / float(self.ts_den))
+        quarter_note = 60.0 / max(1.0, self.bpm)
+        return quarter_note * (4.0 / self.beat_unit)
 
     def bar_seconds(self) -> float:
-        return float(self.ts_num) * self.beat_seconds()
+        return self.beats_per_bar * self.beat_seconds()
 
-    def lookahead_seconds(self) -> float:
-        return self.lookahead_bars * self.bar_seconds()
+    def close(self) -> None:
+        self.audio.close()
 
-    def pixels_per_second(self, roll_width: int) -> float:
-        # roll_width is the actual piano/drum roll width (excluding label strip)
-        playline_local = int(roll_width * self.playline_ratio)
-        visible_right = max(260, roll_width - playline_local - 24)
-        return visible_right / max(0.1, self.lookahead_seconds())
+    def handle_event(self, event: pygame.event.Event) -> Optional[str]:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return "back"
+            if event.key == pygame.K_SPACE:
+                self.toggle_playback()
+            elif event.key == pygame.K_LEFT:
+                self.seek(self.time - 2.0)
+            elif event.key == pygame.K_RIGHT:
+                self.seek(self.time + 2.0)
+            elif event.key == pygame.K_r:
+                self.restart()
+            elif event.key == pygame.K_l:
+                self.loop_enabled = not self.loop_enabled
+            elif event.key == pygame.K_1:
+                self.mode = "piano"
+            elif event.key == pygame.K_2:
+                self.mode = "drums"
+            elif event.key == pygame.K_3:
+                self.mode = "guitar"
 
-    # --------------------------
-    # Color + mapping
-    # --------------------------
-    def _build_channel_color_map(self, notes: List[NoteEvent]) -> Dict[int, Tuple[int, int, int]]:
-        palette = [
-            (125, 95, 210),
-            (90, 180, 160),
-            (220, 140, 90),
-            (90, 140, 220),
-            (220, 90, 140),
-            (160, 200, 90),
-            (200, 120, 220),
-            (120, 200, 240),
-            (240, 200, 120),
-            (160, 140, 220),
-            (120, 220, 170),
-            (220, 160, 120),
-        ]
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for rect, action in reversed(self.actions):
+                if rect.collidepoint(event.pos):
+                    return self._perform_action(action, event.pos)
+        return None
 
-        used = sorted(set(n.channel for n in notes if n.channel != 9))
-        cmap: Dict[int, Tuple[int, int, int]] = {}
-        for i, ch in enumerate(used):
-            cmap[ch] = palette[i % len(palette)]
+    def _perform_action(self, action: str, mouse_position) -> Optional[str]:
+        if action == "back":
+            return "back"
+        if action == "play":
+            self.toggle_playback()
+        elif action == "restart":
+            self.restart()
+        elif action == "timeline" and self.timeline_rect:
+            fraction = (mouse_position[0] - self.timeline_rect.left) / self.timeline_rect.width
+            self.seek(fraction * self.song_length)
+        elif action.startswith("mode:"):
+            self.mode = action.split(":", 1)[1]
+        elif action.startswith("speed:"):
+            self.speed = float(action.split(":", 1)[1])
+        elif action == "metronome":
+            self.metronome = not self.metronome
+        elif action == "set_a":
+            self.loop_a = min(self.time, self.loop_b - 0.2)
+        elif action == "set_b":
+            self.loop_b = max(self.time, self.loop_a + 0.2)
+        elif action == "loop":
+            self.loop_enabled = not self.loop_enabled
+        return None
 
-        # Drums get a neutral base
-        cmap[9] = (210, 210, 215)
-        return cmap
-
-    def _drum_rows(self) -> List[Tuple[str, List[int]]]:
-        # Rows are "music inspired" but physically interpreted on the left
-        return [
-            ("Kick",  [35, 36]),
-            ("Snare", [38, 40]),
-            ("Clap",  [39]),
-            ("HiHat", [42, 44, 46]),
-            ("Tom",   [41, 43, 45, 47, 48, 50]),
-            ("Crash", [49, 57]),
-            ("Ride",  [51, 59]),
-            ("Perc",  [52, 53, 54, 55, 56, 58, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]),
-        ]
-
-    def _build_drum_pitch_map(self, rows: List[Tuple[str, List[int]]]) -> Dict[int, int]:
-        pitch_to_row: Dict[int, int] = {}
-        for idx, (_, pitches) in enumerate(rows):
-            for p in pitches:
-                pitch_to_row[p] = idx
-        return pitch_to_row
-
-    def _compute_piano_pitch_range(self) -> Tuple[int, int]:
-        pitched = [n for n in self.audio_notes if n.channel != 9]
-        if not pitched:
-            return 40, 80
-        lo = min(n.pitch for n in pitched)
-        hi = max(n.pitch for n in pitched)
-        if hi == lo:
-            hi += 1
-        return lo, hi
-
-    # --------------------------
-    # Window-clipping draw helpers (no fade)
-    # --------------------------
-    def _blit_clipped(self, surf: pygame.Surface, dest_rect: pygame.Rect, clip_rect: pygame.Rect):
-        # Step 1: Work out visible portion
-        vis = dest_rect.clip(clip_rect)
-        if vis.width <= 0 or vis.height <= 0:
+    def toggle_playback(self) -> None:
+        if self.playing or self.counting_in:
+            self.playing = False
+            self.counting_in = False
+            self.audio.stop_all_notes()
             return
 
-        # Step 2: Source slice for that visible portion
-        src_x = vis.left - dest_rect.left
-        src_y = vis.top - dest_rect.top
-        src_area = pygame.Rect(src_x, src_y, vis.width, vis.height)
+        if self.options.count_in_bars > 0:
+            self._start_count_in()
+        else:
+            self.playing = True
+            self.audio.start(self.time)
 
-        # Step 3: Blit only the visible slice (smooth "walk off")
-        self.screen.blit(surf, vis.topleft, area=src_area)
+    def _start_count_in(self) -> None:
+        beat_length = self.beat_seconds() / self.speed
+        beat_count = self.options.count_in_bars * self.beats_per_bar
+        self.count_in_total = beat_count * beat_length
+        self.count_in_remaining = self.count_in_total
+        self.count_in_last_beat = -1
+        self.counting_in = True
 
-    def _make_note_surface(self, w: int, h: int, fill_rgb: Tuple[int, int, int], edge_rgb: Tuple[int, int, int], label_text: str):
-        # Step 1: Surface
-        s = pygame.Surface((w, h), pygame.SRCALPHA)
+    def restart(self) -> None:
+        self.playing = False
+        self.counting_in = False
+        self.time = 0.0
+        self.previous_time = 0.0
+        self.audio.seek(0.0)
 
-        # Step 2: Body + border
-        pygame.draw.rect(s, fill_rgb, s.get_rect(), border_radius=10)
-        pygame.draw.rect(s, edge_rgb, s.get_rect(), width=2, border_radius=10)
+    def seek(self, new_time: float) -> None:
+        was_playing = self.playing
+        self.time = float(clamp(new_time, 0.0, self.song_length))
+        self.previous_time = self.time
+        self.counting_in = False
+        self.audio.seek(self.time)
+        if was_playing:
+            self.audio.start(self.time)
 
-        # Step 3: Highlight strip
-        hi = pygame.Rect(2, 2, max(0, w - 4), 6)
-        pygame.draw.rect(s, (255, 255, 255, 110), hi, border_radius=6)
-
-        # Step 4: Label
-        txt = self.font_mono_small.render(label_text, True, self.COL_TEXT)
-        s.blit(txt, (8, 6))
-
-        return s
-
-    # --------------------------
-    # Soft overlap helper (less harsh on the eye)
-    # --------------------------
-    def _draw_soft_overlap(self, inter: pygame.Rect, col_a: Tuple[int, int, int], col_b: Tuple[int, int, int]):
-        # Step 1: Soft blended overlay
-        blend = ((col_a[0] + col_b[0]) // 2, (col_a[1] + col_b[1]) // 2, (col_a[2] + col_b[2]) // 2)
-
-        surf = pygame.Surface((inter.width, inter.height), pygame.SRCALPHA)
-        surf.fill((blend[0], blend[1], blend[2], 95))
-
-        # Step 2: Subtle diagonals (very light)
-        step = 12
-        for i in range(-inter.height, inter.width, step):
-            pygame.draw.line(surf, (255, 255, 255, 28), (i, 0), (i + inter.height, inter.height), 2)
-
-        self.screen.blit(surf, inter.topleft)
-
-    # --------------------------
-    # Hit FX (Synthesia-ish, subtle)
-    # --------------------------
-    def _resync_fx_index(self, t: float):
-        # Step 1: Advance scan index to first note that hasn't started yet
-        self.fx_scan_index = 0
-        while self.fx_scan_index < len(self.audio_notes) and self.audio_notes[self.fx_scan_index].start_sec < t:
-            self.fx_scan_index += 1
-
-    def _spawn_hit_fx_for_note(self, n: NoteEvent):
-        # Step 1: Choose kind + color
-        kind = "drum" if n.channel == 9 else "piano"
-        base = self.channel_colors.get(n.channel, (125, 95, 210))
-
-        # Step 2: Slight boost for the flash
-        col = (min(255, base[0] + 35), min(255, base[1] + 35), min(255, base[2] + 35))
-
-        self.hit_fx.append({
-            "t0": self.time,
-            "kind": kind,
-            "pitch": n.pitch,
-            "channel": n.channel,
-            "color": col
-        })
-
-    def _update_hit_fx(self, dt: float):
-        # Step 1: Remove old FX (short lifespan)
-        life = 0.18
-        now = self.time
-        self.hit_fx = [fx for fx in self.hit_fx if (now - fx["t0"]) <= life]
-
-    def _draw_hit_fx(self, fx: dict, playline_x: int, y: int):
-        # Step 1: FX time progress
-        t = self.time - fx["t0"]
-        life = 0.18
-        if t < 0 or t > life:
+    def update(self, dt: float) -> None:
+        if self.counting_in:
+            self.count_in_remaining -= dt
+            beat_length = self.beat_seconds() / self.speed
+            elapsed = self.count_in_total - max(0.0, self.count_in_remaining)
+            beat_index = int(elapsed / max(0.01, beat_length))
+            if beat_index != self.count_in_last_beat:
+                self.audio.click(beat_index % self.beats_per_bar == 0)
+                self.count_in_last_beat = beat_index
+            if self.count_in_remaining <= 0:
+                self.counting_in = False
+                self.playing = True
+                self.audio.start(self.time)
             return
 
-        # Step 2: Progress 0..1
-        p = t / life
+        if not self.playing:
+            return
 
-        # Step 3: Pulse ring
-        radius = int(6 + p * 26)
-        alpha = int(160 * (1.0 - p))
+        self.elapsed_practice += dt
+        self.previous_time = self.time
+        self.time += dt * self.speed
 
-        ring = pygame.Surface((radius * 2 + 2, radius * 2 + 2), pygame.SRCALPHA)
-        pygame.draw.circle(ring, (fx["color"][0], fx["color"][1], fx["color"][2], alpha),
-                           (radius + 1, radius + 1), radius, width=2)
-
-        self.screen.blit(ring, (playline_x - radius - 1, y - radius - 1))
-
-        # Step 4: Tiny vertical glow tick at playline
-        glow_h = 34
-        glow_w = 10
-        glow = pygame.Surface((glow_w, glow_h), pygame.SRCALPHA)
-        pygame.draw.rect(glow, (fx["color"][0], fx["color"][1], fx["color"][2], int(110 * (1.0 - p))),
-                         glow.get_rect(), border_radius=8)
-        self.screen.blit(glow, (playline_x - glow_w // 2, y - glow_h // 2))
-
-    # --------------------------
-    # Main loop
-    # --------------------------
-    def run(self):
-        try:
-            while True:
-                dt = self.clock.tick(60) / 1000.0
-                self._handle_events()
-                self._update(dt)
-                self._draw()
-                pygame.display.flip()
-        finally:
-            self.audio.close()
-
-    def _handle_events(self):
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                raise SystemExit
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    raise SystemExit
-
-                # SPACE = play/pause
-                if event.key == pygame.K_SPACE:
-                    self.playing = not self.playing
-                    if self.playing:
-                        self.prev_time = self.time
-                        self.audio.start(self.time)
-                        self._resync_fx_index(self.time)
-                    else:
-                        self.audio.stop_all_notes()
-
-                # Left/Right seek (pauses)
-                if event.key == pygame.K_LEFT:
-                    self.time = clamp(self.time - 2.0, 0.0, self.song_length)
-                    self.prev_time = self.time
-                    self.playing = False
-                    self.audio.seek(self.time)
-                    self._resync_fx_index(self.time)
-
-                if event.key == pygame.K_RIGHT:
-                    self.time = clamp(self.time + 2.0, 0.0, self.song_length)
-                    self.prev_time = self.time
-                    self.playing = False
-                    self.audio.seek(self.time)
-                    self._resync_fx_index(self.time)
-
-                # R restart
-                if event.key == pygame.K_r:
-                    self.time = 0.0
-                    self.prev_time = 0.0
-                    self.playing = False
-                    self.audio.seek(self.time)
-                    self._resync_fx_index(self.time)
-
-    def _update(self, dt: float):
-        # Step 1: Update time + audio when playing
-        if self.playing:
-            self.prev_time = self.time
-            self.time += dt
-
-            if self.time >= self.song_length:
-                self.time = self.song_length
-                self.playing = False
-                self.audio.stop_all_notes()
-
+        if self.loop_enabled and self.time >= self.loop_b:
+            self.time = self.loop_a
+            self.previous_time = self.time
+            self.audio.start(self.time)
+        elif self.time >= self.song_length:
+            self.time = self.song_length
+            self.playing = False
+            self.audio.stop_all_notes()
+        else:
             self.audio.update(self.time)
 
-            # Step 2: Trigger hit FX for note-ons crossed this frame (efficient scan)
-            while self.fx_scan_index < len(self.audio_notes):
-                n = self.audio_notes[self.fx_scan_index]
-                if n.start_sec <= self.time and n.start_sec > self.prev_time:
-                    self._spawn_hit_fx_for_note(n)
-                    self.fx_scan_index += 1
-                elif n.start_sec <= self.prev_time:
-                    self.fx_scan_index += 1
-                else:
-                    break
+        if self.metronome:
+            old_beat = int(self.previous_time / self.beat_seconds())
+            new_beat = int(self.time / self.beat_seconds())
+            if new_beat != old_beat:
+                self.audio.click(new_beat % self.beats_per_bar == 0)
 
-        # Step 3: Update FX lifetimes (even when paused, it looks fine)
-        self._update_hit_fx(dt)
+    def draw(self) -> None:
+        self.actions = []
+        width, height = self.screen.get_size()
+        self.screen.fill(self.theme.background)
 
-    # --------------------------
-    # Draw
-    # --------------------------
-    def _draw(self):
-        w, h = self.screen.get_size()
+        header = pygame.Rect(18, 16, width - 36, 92)
+        controls = pygame.Rect(18, height - 142, width - 36, 124)
+        content = pygame.Rect(18, 122, width - 36, height - 282)
+        self._draw_header(header)
+        self._draw_content(content)
+        self._draw_controls(controls)
 
-        top_rect = pygame.Rect(16, 14, w - 32, self.top_h)
-        mid_rect = pygame.Rect(16, 14 + self.top_h + 12, w - 32, h - self.top_h - self.bottom_h - 40)
-        bot_rect = pygame.Rect(16, h - self.bottom_h - 14, w - 32, self.bottom_h)
+        if self.counting_in:
+            self._draw_count_in_overlay()
 
-        self.screen.fill(self.COL_BG)
-        self._draw_top(top_rect)
-        self._draw_mid(mid_rect)
-        self._draw_bottom(bot_rect)
+    def _register_button(
+        self, rect: pygame.Rect, text: str, action: str, selected: bool = False, danger: bool = False
+    ) -> None:
+        hovered = rect.collidepoint(pygame.mouse.get_pos())
+        if danger:
+            colour = self.theme.red
+        elif selected:
+            colour = self.theme.accent
+        elif hovered:
+            colour = self.theme.panel_hover
+        else:
+            colour = self.theme.panel_light
+        pygame.draw.rect(self.screen, colour, rect, border_radius=10)
+        draw_text(
+            self.screen,
+            text,
+            self.fonts.small_bold,
+            self.theme.text,
+            rect.center,
+            "center",
+        )
+        self.actions.append((rect, action))
 
-    def _draw_top(self, r: pygame.Rect):
-        self._card(r, self.COL_PANEL)
+    def _chip(self, x: int, y: int, text: str) -> int:
+        rendered = self.fonts.small.render(text, True, self.theme.text_dim)
+        rect = pygame.Rect(x, y, rendered.get_width() + 20, 28)
+        pygame.draw.rect(self.screen, self.theme.panel_light, rect, border_radius=14)
+        self.screen.blit(rendered, (rect.left + 10, rect.centery - rendered.get_height() // 2))
+        return rect.right + 8
 
-        title_surf = self.font_ui.render("JAMSPOT", True, self.COL_TEXT)
-        self.screen.blit(title_surf, (r.left + 16, r.top + 16))
+    def _draw_header(self, rect: pygame.Rect) -> None:
+        draw_card(self.screen, rect, self.theme.panel)
+        self._register_button(pygame.Rect(rect.left + 14, rect.top + 14, 70, 34), "BACK", "back")
+        draw_text(self.screen, self.title, self.fonts.heading, self.theme.text, (rect.left + 100, rect.top + 14))
+        draw_text(
+            self.screen,
+            self.part["name"],
+            self.fonts.small,
+            self.theme.text_dim,
+            (rect.left + 102, rect.top + 51),
+        )
 
-        sub = self.font_mono.render(self.title, True, self.COL_TEXT_DIM)
-        self.screen.blit(sub, (r.left + 16, r.top + 46))
+        mode_x = rect.right - 322
+        for label, mode in (("PIANO", "piano"), ("DRUMS", "drums"), ("TAB", "guitar")):
+            button_rect = pygame.Rect(mode_x, rect.top + 14, 94, 34)
+            self._register_button(button_rect, label, f"mode:{mode}", self.mode == mode)
+            mode_x += 102
 
-        x = r.left + 420
-        x = self._chip(x, r.top + 18, f"PART: {self.part_name}")
-        x = self._chip(x, r.top + 18, f"KEY: {self.key_sig}")
-        x = self._chip(x, r.top + 18, f"BPM: {self.bpm:.1f}")
-        x = self._chip(x, r.top + 18, f"TIME: {self.time_sig}")
+        chip_x = rect.right - 322
+        chip_y = rect.top + 55
+        chip_x = self._chip(chip_x, chip_y, f"{self.bpm:.0f} BPM")
+        chip_x = self._chip(chip_x, chip_y, self.time_signature)
+        self._chip(chip_x, chip_y, f"KEY {self.key_signature}")
 
-    def _draw_mid(self, r: pygame.Rect):
-        self._card(r, self.COL_PANEL)
+    def _draw_content(self, rect: pygame.Rect) -> None:
+        draw_card(self.screen, rect, self.theme.panel)
+        inner = rect.inflate(-24, -24)
+        if self.mode == "drums":
+            self._draw_drums(inner)
+        elif self.mode == "guitar":
+            self._draw_guitar(inner)
+        else:
+            self._draw_piano(inner)
 
-        pad = 14
-        inner = pygame.Rect(r.left + pad, r.top + pad, r.width - pad * 2, r.height - pad * 2)
+    def _time_geometry(self, rect: pygame.Rect):
+        playline = rect.left + int(rect.width * 0.28)
+        seconds_right = max(self.bar_seconds() * 2.5, 2.0)
+        pixels_per_second = (rect.right - playline - 18) / seconds_right
+        visible_start = self.time - (playline - rect.left) / pixels_per_second
+        visible_end = self.time + seconds_right
+        return playline, pixels_per_second, visible_start, visible_end
 
-        # Step 1: Only drums => only drums roll
-        if self.has_drums and not self.has_pitched:
-            self._draw_drums_only(inner)
-            return
-
-        # Step 2: Only pitched => only piano roll
-        if self.has_pitched and not self.has_drums:
-            self._draw_piano_only(inner)
-            return
-
-        # Step 3: Both => split vertically (same roll width => aligned grid lines)
-        drum_h = int(inner.height * 0.28)
-        pitched_h = inner.height - drum_h
-
-        pitched_rect = pygame.Rect(inner.left, inner.top, inner.width, pitched_h)
-        drums_rect = pygame.Rect(inner.left, inner.top + pitched_h, inner.width, drum_h)
-
-        # Separator line
-        pygame.draw.line(self.screen, (35, 40, 55), (drums_rect.left, drums_rect.top), (drums_rect.right, drums_rect.top), 1)
-
-        # Shared roll geometry (same label width + same roll width)
-        roll_width = inner.width - self.roll_label_w
-        pps = self.pixels_per_second(roll_width)
-
-        # Both rolls use the SAME playline x (aligned)
-        roll_left = inner.left + self.roll_label_w
-        playline_x = roll_left + int(roll_width * self.playline_ratio)
-
-        self._draw_roll_piano(pitched_rect, pps, playline_x)
-        self._draw_roll_drums(drums_rect, pps, playline_x)
-
-    def _draw_piano_only(self, inner: pygame.Rect):
-        roll_width = inner.width - self.roll_label_w
-        pps = self.pixels_per_second(roll_width)
-        roll_left = inner.left + self.roll_label_w
-        playline_x = roll_left + int(roll_width * self.playline_ratio)
-        self._draw_roll_piano(inner, pps, playline_x)
-
-    def _draw_drums_only(self, inner: pygame.Rect):
-        roll_width = inner.width - self.roll_label_w
-        pps = self.pixels_per_second(roll_width)
-        roll_left = inner.left + self.roll_label_w
-        playline_x = roll_left + int(roll_width * self.playline_ratio)
-        self._draw_roll_drums(inner, pps, playline_x)
-
-    # --------------------------
-    # Grid
-    # --------------------------
-    def _draw_grid(self, r: pygame.Rect, playline_x: int, pps: float):
+    def _draw_time_grid(self, rect: pygame.Rect, playline: int, pixels_per_second: float) -> None:
         beat = self.beat_seconds()
         bar = self.bar_seconds()
+        visible_start = self.time - (playline - rect.left) / pixels_per_second
+        visible_end = self.time + (rect.right - playline) / pixels_per_second
 
-        left_seconds = (playline_x - r.left) / max(1e-6, pps)
-        window_start = self.time - left_seconds
-        window_end = self.time + self.lookahead_seconds()
+        beat_number = math.floor(visible_start / beat)
+        while beat_number * beat <= visible_end + beat:
+            beat_time = beat_number * beat
+            x = playline + int((beat_time - self.time) * pixels_per_second)
+            if rect.left <= x <= rect.right:
+                colour = self.theme.border
+                line_width = 2 if beat_number % self.beats_per_bar == 0 else 1
+                pygame.draw.line(self.screen, colour, (x, rect.top), (x, rect.bottom), line_width)
+            beat_number += 1
+        pygame.draw.line(
+            self.screen, self.theme.accent_light, (playline, rect.top), (playline, rect.bottom), 3
+        )
 
-        # Beat lines
-        first_beat_index = int(math.floor(window_start / beat))
-        t = first_beat_index * beat
-        while t <= window_end + beat:
-            x = playline_x + int((t - self.time) * pps)
-            if r.left <= x <= r.right:
-                pygame.draw.line(self.screen, self.COL_BEAT, (x, r.top + 6), (x, r.bottom - 6), 1)
-            t += beat
+    def _draw_piano(self, rect: pygame.Rect) -> None:
+        pitched = [note for note in self.notes if note.channel != 9]
+        if not pitched:
+            self._empty_state(rect, "This selected part has no pitched notes.", "Try the DRUMS view.")
+            return
 
-        # Bar lines
-        first_bar_index = int(math.floor(window_start / bar))
-        t = first_bar_index * bar
-        while t <= window_end + bar:
-            x = playline_x + int((t - self.time) * pps)
-            if r.left <= x <= r.right:
-                pygame.draw.line(self.screen, self.COL_BAR, (x, r.top + 6), (x, r.bottom - 6), 2)
-            t += bar
+        label_width = 80
+        roll = pygame.Rect(rect.left + label_width, rect.top, rect.width - label_width, rect.height)
+        pygame.draw.rect(self.screen, (12, 15, 22), roll, border_radius=12)
+        playline, pps, start, end = self._time_geometry(roll)
+        self._draw_time_grid(roll, playline, pps)
 
-    # --------------------------
-    # Piano roll
-    # --------------------------
-    def _draw_roll_piano(self, r: pygame.Rect, pps: float, playline_x: int):
-        label_rect = pygame.Rect(r.left, r.top, self.roll_label_w, r.height)
-        roll_rect = pygame.Rect(r.left + self.roll_label_w, r.top, r.width - self.roll_label_w, r.height)
+        low = min(note.pitch for note in pitched) - 2
+        high = max(note.pitch for note in pitched) + 2
+        pitch_range = max(1, high - low)
+        draw_text(self.screen, f"HIGH {high}", self.fonts.small, self.theme.text_dim, (rect.left, rect.top + 4))
+        draw_text(
+            self.screen,
+            f"LOW {low}",
+            self.fonts.small,
+            self.theme.text_dim,
+            (rect.left, rect.bottom - 20),
+        )
 
-        pygame.draw.rect(self.screen, self.COL_PANEL_2, label_rect, border_radius=14)
-        pygame.draw.rect(self.screen, (12, 14, 20), roll_rect, border_radius=14)
-
-        # Left strip labels
-        hi = self.piano_hi
-        lo = self.piano_lo
-        top_label = self.font_mono_small.render(f"HI {hi}", True, self.COL_TEXT_DIM)
-        bot_label = self.font_mono_small.render(f"LO {lo}", True, self.COL_TEXT_DIM)
-        self.screen.blit(top_label, (label_rect.left + 12, label_rect.top + 10))
-        self.screen.blit(bot_label, (label_rect.left + 12, label_rect.bottom - 24))
-
-        # Clip to roll window (smooth "walk off")
-        self.screen.set_clip(roll_rect)
-
-        # Grid + playline
-        self._draw_grid(roll_rect, playline_x, pps)
-        pygame.draw.line(self.screen, self.COL_PLAYLINE, (playline_x, roll_rect.top), (playline_x, roll_rect.bottom), 2)
-
-        # Map pitch->y using stable range
-        if self.piano_hi == self.piano_lo:
-            self.piano_hi += 1
-
-        def pitch_to_y(p: int) -> int:
-            frac = (p - self.piano_lo) / (self.piano_hi - self.piano_lo)
-            usable_h = roll_rect.height - 44
-            return roll_rect.bottom - 22 - int(frac * usable_h)
-
-        # Visible window in seconds
-        left_seconds = (playline_x - roll_rect.left) / max(1e-6, pps)
-        window_start = self.time - left_seconds
-        window_end = self.time + self.lookahead_seconds()
-
-        # Draw notes
-        pitched_notes = [n for n in self.draw_notes if n.channel != 9]
-
-        drawn: List[Tuple[pygame.Rect, Tuple[int, int, int]]] = []
-        for n in pitched_notes:
-            if n.start_sec > window_end:
+        self.screen.set_clip(roll)
+        for note in pitched:
+            if note.start_sec > end:
                 break
-            if (n.start_sec + n.duration_sec) < window_start:
+            if note.start_sec + note.duration_sec < start:
                 continue
-
-            x = playline_x + int((n.start_sec - self.time) * pps)
-            w = max(8, int(n.duration_sec * pps))
-            y = pitch_to_y(n.pitch) - 14
-            rect = pygame.Rect(x, y, w, 28)
-
-            base = self.channel_colors.get(n.channel, (125, 95, 210))
-            edge = (min(255, base[0] + 40), min(255, base[1] + 40), min(255, base[2] + 40))
-
-            note_surf = self._make_note_surface(rect.width, rect.height, base, edge, n.label)
-            self._blit_clipped(note_surf, rect, roll_rect)
-
-            vis = rect.clip(roll_rect)
-            if vis.width > 0 and vis.height > 0:
-                # Soft overlap blend
-                for prev_rect, prev_col in drawn:
-                    if vis.colliderect(prev_rect):
-                        self._draw_soft_overlap(vis.clip(prev_rect), prev_col, base)
-                drawn.append((vis, base))
-
-        # Hit FX for pitched notes (at playline)
-        for fx in self.hit_fx:
-            if fx["kind"] != "piano":
-                continue
-            y = pitch_to_y(fx["pitch"])
-            self._draw_hit_fx(fx, playline_x, y)
-
+            fraction = (note.pitch - low) / pitch_range
+            y = roll.bottom - 24 - int(fraction * (roll.height - 48))
+            x = playline + int((note.start_sec - self.time) * pps)
+            note_width = max(10, int(note.duration_sec * pps))
+            note_rect = pygame.Rect(x, y - 11, note_width, 23)
+            pygame.draw.rect(self.screen, self.theme.accent, note_rect, border_radius=7)
+            if note_rect.width > 42:
+                draw_text(
+                    self.screen,
+                    note.label,
+                    self.fonts.small_bold,
+                    self.theme.text,
+                    (note_rect.left + 7, note_rect.top + 4),
+                )
         self.screen.set_clip(None)
 
-    # --------------------------
-    # Drum roll
-    # --------------------------
-    def _draw_roll_drums(self, r: pygame.Rect, pps: float, playline_x: int):
-        label_rect = pygame.Rect(r.left, r.top, self.roll_label_w, r.height)
-        roll_rect = pygame.Rect(r.left + self.roll_label_w, r.top, r.width - self.roll_label_w, r.height)
+    def _drum_row(self, pitch: int) -> int:
+        for index, (_, pitches) in enumerate(self.DRUM_ROWS[:-1]):
+            if pitch in pitches:
+                return index
+        return len(self.DRUM_ROWS) - 1
 
-        pygame.draw.rect(self.screen, self.COL_PANEL_2, label_rect, border_radius=14)
-        pygame.draw.rect(self.screen, (12, 14, 20), roll_rect, border_radius=14)
+    def _draw_drums(self, rect: pygame.Rect) -> None:
+        drum_notes = [note for note in self.notes if note.channel == 9]
+        if not drum_notes:
+            self._empty_state(rect, "This selected part is not a drum track.", "Choose a drum part or use PIANO/TAB.")
+            return
 
-        rows = self.drum_rows
-        row_h = max(22, int(roll_rect.height / max(6, len(rows))))
-        row_h = min(row_h, 44)
+        label_width = 105
+        roll = pygame.Rect(rect.left + label_width, rect.top, rect.width - label_width, rect.height)
+        pygame.draw.rect(self.screen, (12, 15, 22), roll, border_radius=12)
+        row_height = roll.height / len(self.DRUM_ROWS)
+        playline, pps, start, end = self._time_geometry(roll)
 
-        # Draw the kit labels + simple physical icons on the left (no clip)
-        self._draw_drum_kit_labels(label_rect, rows, row_h)
+        for index, (name, _) in enumerate(self.DRUM_ROWS):
+            y = roll.top + int(index * row_height)
+            lane = pygame.Rect(roll.left, y, roll.width, math.ceil(row_height))
+            if index % 2 == 0:
+                pygame.draw.rect(self.screen, (16, 19, 27), lane)
+            pygame.draw.line(self.screen, self.theme.border, (roll.left, lane.bottom), (roll.right, lane.bottom))
+            draw_text(
+                self.screen,
+                name.upper(),
+                self.fonts.small_bold,
+                self.theme.text_dim,
+                (rect.left + 4, y + row_height / 2),
+                "midleft",
+            )
+        self._draw_time_grid(roll, playline, pps)
 
-        # Clip to drum roll window
-        self.screen.set_clip(roll_rect)
-
-        # Grid + playline
-        self._draw_grid(roll_rect, playline_x, pps)
-        pygame.draw.line(self.screen, self.COL_PLAYLINE, (playline_x, roll_rect.top), (playline_x, roll_rect.bottom), 2)
-
-        # Lane shading
-        for i, _ in enumerate(rows):
-            y0 = roll_rect.top + i * row_h
-            y1 = y0 + row_h
-            if y0 >= roll_rect.bottom:
+        self.screen.set_clip(roll)
+        for note in drum_notes:
+            if note.start_sec > end:
                 break
-
-            if i % 2 == 0:
-                lane = pygame.Rect(roll_rect.left, y0, roll_rect.width, row_h)
-                pygame.draw.rect(self.screen, (14, 16, 22), lane)
-
-            pygame.draw.line(self.screen, (30, 34, 48), (roll_rect.left, y1), (roll_rect.right, y1), 1)
-
-        # Visible window in seconds
-        left_seconds = (playline_x - roll_rect.left) / max(1e-6, pps)
-        window_start = self.time - left_seconds
-        window_end = self.time + self.lookahead_seconds()
-
-        # Draw drum notes (channel 9)
-        drum_notes = [n for n in self.audio_notes if n.channel == 9]
-        drawn: List[Tuple[pygame.Rect, Tuple[int, int, int]]] = []
-
-        for n in drum_notes:
-            if n.start_sec > window_end:
-                break
-            if (n.start_sec + max(0.02, n.duration_sec)) < window_start:
+            if note.start_sec + note.duration_sec < start:
                 continue
-
-            row = self.drum_pitch_to_row.get(n.pitch, len(rows) - 1)
-            y0 = roll_rect.top + row * row_h + 4
-            if y0 > roll_rect.bottom:
-                continue
-
-            x = playline_x + int((n.start_sec - self.time) * pps)
-            w = max(10, int(max(0.03, n.duration_sec) * pps))
-            rect = pygame.Rect(x, y0, w, row_h - 8)
-
-            # Velocity makes drums "pop" slightly
-            base = self.channel_colors.get(9, (210, 210, 215))
-            vel = max(1, min(127, n.velocity))
-            boost = int((vel / 127.0) * 35)
-            base2 = (min(255, base[0] + boost), min(255, base[1] + boost), min(255, base[2] + boost))
-            edge = (max(0, base2[0] - 30), max(0, base2[1] - 30), max(0, base2[2] - 30))
-
-            lane_name = rows[row][0]
-            note_surf = self._make_note_surface(rect.width, rect.height, base2, edge, lane_name)
-            self._blit_clipped(note_surf, rect, roll_rect)
-
-            vis = rect.clip(roll_rect)
-            if vis.width > 0 and vis.height > 0:
-                for prev_rect, prev_col in drawn:
-                    if vis.colliderect(prev_rect):
-                        self._draw_soft_overlap(vis.clip(prev_rect), prev_col, base2)
-                drawn.append((vis, base2))
-
-        # Hit FX for drums (at playline, centered on lane)
-        for fx in self.hit_fx:
-            if fx["kind"] != "drum":
-                continue
-            row = self.drum_pitch_to_row.get(fx["pitch"], len(rows) - 1)
-            y_center = roll_rect.top + row * row_h + (row_h // 2)
-            self._draw_hit_fx(fx, playline_x, y_center)
-
+            row = self._drum_row(note.pitch)
+            y = roll.top + int((row + 0.5) * row_height)
+            x = playline + int((note.start_sec - self.time) * pps)
+            radius = 6 + int(note.velocity / 127 * 6)
+            pygame.draw.circle(self.screen, self.theme.orange, (x, y), radius)
+            pygame.draw.circle(self.screen, self.theme.text, (x, y), radius, 1)
         self.screen.set_clip(None)
 
-    def _draw_drum_kit_labels(self, label_rect: pygame.Rect, rows: List[Tuple[str, List[int]]], row_h: int):
-        # Step 1: Draw lane labels + simple “kit” icons (physical interpretation)
-        for i, (name, _) in enumerate(rows):
-            cy = label_rect.top + i * row_h + row_h // 2
-            if cy > label_rect.bottom:
+    def _draw_guitar(self, rect: pygame.Rect) -> None:
+        if not self.tab_events:
+            self._empty_state(rect, "No guitar tablature can be made from this part.", "Choose a pitched instrument part.")
+            return
+
+        label_width = 52
+        roll = pygame.Rect(rect.left + label_width, rect.top + 35, rect.width - label_width, rect.height - 55)
+        pygame.draw.rect(self.screen, (12, 15, 22), roll, border_radius=12)
+        playline, pps, start, end = self._time_geometry(roll)
+        string_gap = roll.height / 6
+
+        stats = tab_statistics(self.tab_events)
+        draw_text(
+            self.screen,
+            f"STANDARD TUNING  |  {stats['mapped']} notes mapped  |  highest fret {stats['highest_fret']}",
+            self.fonts.small,
+            self.theme.text_dim,
+            (rect.left, rect.top + 2),
+        )
+
+        for index, (name, _) in enumerate(STANDARD_TUNING):
+            y = roll.top + int((index + 0.5) * string_gap)
+            draw_text(
+                self.screen,
+                name,
+                self.fonts.body_bold,
+                self.theme.text,
+                (rect.left + 17, y),
+                "center",
+            )
+            line_colour = (126, 130, 142) if index < 3 else (170, 173, 181)
+            pygame.draw.line(self.screen, line_colour, (roll.left, y), (roll.right, y), 1 + index // 3)
+        self._draw_time_grid(roll, playline, pps)
+
+        self.screen.set_clip(roll)
+        for event in self.tab_events:
+            if event.start_sec > end:
                 break
+            if event.start_sec + event.duration_sec < start or event.string_index < 0:
+                continue
+            x = playline + int((event.start_sec - self.time) * pps)
+            y = roll.top + int((event.string_index + 0.5) * string_gap)
+            radius = 15
+            colour = self.theme.green if event.start_sec <= self.time < event.start_sec + event.duration_sec else self.theme.accent
+            pygame.draw.circle(self.screen, colour, (x, y), radius)
+            draw_text(
+                self.screen,
+                str(event.fret),
+                self.fonts.small_bold,
+                self.theme.text,
+                (x, y),
+                "center",
+            )
+        self.screen.set_clip(None)
 
-            icon_x = label_rect.left + 20
-            text_x = label_rect.left + 44
-
-            # Minimal icon set (readable + techy)
-            if name == "Kick":
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x, cy), 10, width=2)
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x, cy), 3, width=0)
-            elif name == "Snare":
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x, cy), 8, width=2)
-            elif name == "HiHat":
-                pygame.draw.line(self.screen, (205, 210, 220), (icon_x - 9, cy + 6), (icon_x + 9, cy + 6), 2)
-                pygame.draw.line(self.screen, (205, 210, 220), (icon_x - 11, cy - 2), (icon_x + 11, cy - 2), 2)
-            elif name in ("Crash", "Ride"):
-                pygame.draw.arc(self.screen, (205, 210, 220), pygame.Rect(icon_x - 12, cy - 8, 24, 16), math.pi, 2 * math.pi, 2)
-                pygame.draw.line(self.screen, (205, 210, 220), (icon_x, cy), (icon_x, cy + 10), 2)
-            elif name == "Tom":
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x, cy), 6, width=2)
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x + 10, cy), 5, width=2)
-            else:
-                pygame.draw.circle(self.screen, (205, 210, 220), (icon_x, cy), 5, width=2)
-
-            label = self.font_mono_small.render(name.upper(), True, self.COL_TEXT_DIM)
-            self.screen.blit(label, (text_x, cy - 8))
-
-    # --------------------------
-    # Bottom bar
-    # --------------------------
-    def _draw_bottom(self, r: pygame.Rect):
-        self._card(r, self.COL_PANEL)
-
-        status = "PLAYING" if self.playing else "PAUSED"
-        left = self.font_mono.render(f"{status}", True, self.COL_TEXT)
-        self.screen.blit(left, (r.left + 16, r.top + 16))
-
-        hint = self.font_mono_small.render(
-            "SPACE play/pause   LEFT/RIGHT seek   R restart   ESC quit",
-            True, self.COL_TEXT_DIM
+    def _empty_state(self, rect: pygame.Rect, title: str, subtitle: str) -> None:
+        draw_text(self.screen, title, self.fonts.subheading, self.theme.text, rect.center, "center")
+        draw_text(
+            self.screen,
+            subtitle,
+            self.fonts.body,
+            self.theme.text_dim,
+            (rect.centerx, rect.centery + 34),
+            "center",
         )
-        self.screen.blit(hint, (r.left + 16, r.top + 44))
 
-        # Timeline bar
-        bar = pygame.Rect(r.left + 16, r.bottom - 34, r.width - 32, 14)
-        pygame.draw.rect(self.screen, self.COL_PANEL_2, bar, border_radius=999)
+    def _draw_controls(self, rect: pygame.Rect) -> None:
+        draw_card(self.screen, rect, self.theme.panel)
+        play_text = "PAUSE" if self.playing or self.counting_in else "PLAY"
+        self._register_button(pygame.Rect(rect.left + 14, rect.top + 14, 84, 38), play_text, "play", True)
+        self._register_button(pygame.Rect(rect.left + 106, rect.top + 14, 78, 38), "RESTART", "restart")
 
-        progress = int((self.time / max(0.1, self.song_length)) * bar.width)
-        fill = pygame.Rect(bar.left, bar.top, progress, bar.height)
-        pygame.draw.rect(self.screen, (160, 170, 200), fill, border_radius=999)
+        speed_x = rect.left + 202
+        for speed in (0.5, 0.75, 1.0, 1.25):
+            button = pygame.Rect(speed_x, rect.top + 14, 58, 38)
+            self._register_button(button, f"{speed:g}x", f"speed:{speed}", self.speed == speed)
+            speed_x += 64
 
-        # Thumb
-        thumb_x = bar.left + progress
-        thumb = pygame.Rect(thumb_x - 7, bar.top - 5, 14, bar.height + 10)
-        pygame.draw.rect(self.screen, self.COL_PLAYLINE, thumb, border_radius=8)
-
-        # Time text
-        ttxt = self.font_mono.render(
-            f"{self._fmt_time(self.time)} / {self._fmt_time(self.song_length)}",
-            True, self.COL_TEXT_DIM
+        self._register_button(
+            pygame.Rect(speed_x + 10, rect.top + 14, 102, 38),
+            "METRONOME",
+            "metronome",
+            self.metronome,
         )
-        self.screen.blit(ttxt, (r.right - 16 - ttxt.get_width(), r.top + 16))
+        self._register_button(pygame.Rect(speed_x + 120, rect.top + 14, 62, 38), "SET A", "set_a")
+        self._register_button(pygame.Rect(speed_x + 188, rect.top + 14, 62, 38), "SET B", "set_b")
+        self._register_button(
+            pygame.Rect(speed_x + 256, rect.top + 14, 68, 38), "LOOP", "loop", self.loop_enabled
+        )
+
+        status = "PLAYING" if self.playing else "COUNT-IN" if self.counting_in else "PAUSED"
+        draw_text(self.screen, status, self.fonts.small_bold, self.theme.text, (rect.right - 106, rect.top + 26), "midleft")
+
+        timeline = pygame.Rect(rect.left + 16, rect.bottom - 42, rect.width - 32, 15)
+        self.timeline_rect = timeline
+        pygame.draw.rect(self.screen, self.theme.panel_light, timeline, border_radius=8)
+        progress = int(timeline.width * self.time / max(0.1, self.song_length))
+        pygame.draw.rect(
+            self.screen,
+            self.theme.accent,
+            pygame.Rect(timeline.left, timeline.top, progress, timeline.height),
+            border_radius=8,
+        )
+        thumb_x = timeline.left + progress
+        pygame.draw.circle(self.screen, self.theme.text, (thumb_x, timeline.centery), 8)
+        self.actions.append((timeline.inflate(0, 16), "timeline"))
+
+        time_text = f"{format_time(self.time)} / {format_time(self.song_length)}"
+        draw_text(
+            self.screen,
+            time_text,
+            self.fonts.small,
+            self.theme.text_dim,
+            (timeline.right, timeline.top - 8),
+            "bottomright",
+        )
+        loop_text = f"LOOP {format_time(self.loop_a)} - {format_time(self.loop_b)}"
+        draw_text(
+            self.screen,
+            loop_text,
+            self.fonts.small,
+            self.theme.text_dim,
+            (timeline.left, timeline.top - 8),
+            "bottomleft",
+        )
+
+    def _draw_count_in_overlay(self) -> None:
+        width, height = self.screen.get_size()
+        overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+        overlay.fill((5, 6, 10, 185))
+        self.screen.blit(overlay, (0, 0))
+        beat_length = self.beat_seconds() / self.speed
+        beats_left = max(1, math.ceil(self.count_in_remaining / beat_length))
+        number = ((beats_left - 1) % self.beats_per_bar) + 1
+        draw_text(
+            self.screen,
+            str(number),
+            pygame.font.SysFont("arial", 112, bold=True),
+            self.theme.text,
+            (width // 2, height // 2 - 18),
+            "center",
+        )
+        draw_text(
+            self.screen,
+            "GET READY",
+            self.fonts.subheading,
+            self.theme.accent_light,
+            (width // 2, height // 2 + 72),
+            "center",
+        )
+
+
+class Visualiser:
+    """Compatibility wrapper for older code that launched the visualiser directly."""
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("Launch JamSpot through main.py to use the complete multi-page app.")

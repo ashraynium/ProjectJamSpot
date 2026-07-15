@@ -1,0 +1,1 @@
+"""JamSpot application package."""

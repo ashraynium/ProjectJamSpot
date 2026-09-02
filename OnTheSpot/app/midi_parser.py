@@ -54,28 +54,40 @@ class MidiParser:
         cleaned: Dict[int, TempoEvent] = {}
         for event in events:
             cleaned[event.tick] = event
+
         self.tempo_map = [cleaned[tick] for tick in sorted(cleaned)]
-        self.initial_bpm = round(mido.tempo2bpm(self.tempo_map[0].tempo_us_per_beat), 3)
+        self.initial_bpm = round(
+            mido.tempo2bpm(self.tempo_map[0].tempo_us_per_beat),
+            3,
+        )
 
     def tick_to_seconds(self, tick: int) -> float:
         last = self.tempo_map[0]
+
         for event in self.tempo_map:
             if event.tick > tick:
                 break
             last = event
+
         remaining = tick - last.tick
+
         return last.seconds_at_tick + mido.tick2second(
-            remaining, self.ticks_per_beat, last.tempo_us_per_beat
+            remaining,
+            self.ticks_per_beat,
+            last.tempo_us_per_beat,
         )
 
     def _extract_meta_info(self) -> None:
         self.time_signatures = []
         self.key_signatures = []
+
         for msg in mido.merge_tracks(self.mid.tracks):
             if msg.type == "time_signature":
                 value = f"{msg.numerator}/{msg.denominator}"
+
                 if value not in self.time_signatures:
                     self.time_signatures.append(value)
+
             elif msg.type == "key_signature" and msg.key not in self.key_signatures:
                 self.key_signatures.append(msg.key)
 
@@ -87,26 +99,45 @@ class MidiParser:
         for track_index, track in enumerate(self.mid.tracks):
             abs_tick = 0
             track_name = f"Track {track_index + 1}"
+
             notes_by_channel: Dict[int, List[NoteEvent]] = {}
             programs_by_channel: Dict[int, int] = {}
             active: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
 
             for msg in track:
                 abs_tick += msg.time
+
                 if msg.type == "track_name" and msg.name.strip():
                     track_name = msg.name.strip()
+
                 elif msg.type == "program_change":
                     programs_by_channel[msg.channel] = msg.program
+
                 elif msg.type == "note_on" and msg.velocity > 0:
-                    active.setdefault((msg.channel, msg.note), []).append((abs_tick, msg.velocity))
-                elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                    active.setdefault(
+                        (msg.channel, msg.note),
+                        [],
+                    ).append(
+                        (abs_tick, msg.velocity)
+                    )
+
+                elif msg.type == "note_off" or (
+                    msg.type == "note_on" and msg.velocity == 0
+                ):
                     key = (msg.channel, msg.note)
+
                     if not active.get(key):
                         continue
+
                     start_tick, velocity = active[key].pop(0)
+
                     start = self.tick_to_seconds(start_tick)
                     end = self.tick_to_seconds(abs_tick)
-                    notes_by_channel.setdefault(msg.channel, []).append(
+
+                    notes_by_channel.setdefault(
+                        msg.channel,
+                        [],
+                    ).append(
                         NoteEvent(
                             pitch=msg.note,
                             velocity=velocity,
@@ -119,15 +150,24 @@ class MidiParser:
 
             for channel, notes in notes_by_channel.items():
                 notes.sort(key=lambda note: note.start_sec)
+
                 stats = self._track_stats(notes)
                 is_drums = channel == 9
                 program = programs_by_channel.get(channel, 0)
-                instrument = "Drums" if is_drums else instrument_family(program)
+
+                instrument = (
+                    "Drums"
+                    if is_drums
+                    else instrument_family(program)
+                )
+
                 display_name = track_name
+
                 if instrument.lower() not in track_name.lower():
                     display_name = f"{track_name} - {instrument}"
 
                 part_index = len(self.parts_summary)
+
                 self.parts_summary.append(
                     {
                         "part_index": part_index,
@@ -144,22 +184,33 @@ class MidiParser:
                         "max_polyphony": stats["max_polyphony"],
                     }
                 )
+
                 self.parts_notes.append(notes)
-                self.parts_programs.append({channel: program} if not is_drums else {})
+
+                self.parts_programs.append(
+                    {channel: program}
+                    if not is_drums
+                    else {}
+                )
 
     def _track_stats(self, notes: List[NoteEvent]) -> dict:
         pitches = [note.pitch for note in notes]
+
         events = []
+
         for note in notes:
             events.append((note.start_sec, 1))
             events.append((note.start_sec + note.duration_sec, -1))
+
         events.sort(key=lambda item: (item[0], -item[1]))
 
         current = 0
         maximum = 0
+
         for _, change in events:
             current += change
             maximum = max(maximum, current)
+
         return {
             "lowest_pitch": min(pitches),
             "highest_pitch": max(pitches),
@@ -172,20 +223,44 @@ class MidiParser:
             for part in self.parts_notes
             for note in part
         )
-        self.song_length_seconds = max(note_end, float(getattr(self.mid, "length", 0.0)))
+
+        self.song_length_seconds = max(
+            note_end,
+            float(getattr(self.mid, "length", 0.0)),
+        )
 
     def auto_pick_part(self) -> int:
-        pitched = [part for part in self.parts_summary if not part["is_drums"]]
+        pitched = [
+            part
+            for part in self.parts_summary
+            if not part["is_drums"]
+        ]
+
         choices = pitched or self.parts_summary
-        melody = [part for part in choices if part["max_polyphony"] <= 2]
+
+        melody = [
+            part
+            for part in choices
+            if part["max_polyphony"] <= 2
+        ]
+
         choices = melody or choices
-        return max(choices, key=lambda part: part["note_count"])["part_index"]
+
+        return max(
+            choices,
+            key=lambda part: part["note_count"],
+        )["part_index"]
 
     def print_summary(self) -> None:
         print(f"File: {self.midi_path}")
-        print(f"BPM: {self.initial_bpm} | Length: {self.song_length_seconds:.2f}s")
+        print(
+            f"BPM: {self.initial_bpm} | "
+            f"Length: {self.song_length_seconds:.2f}s"
+        )
+
         for part in self.parts_summary:
             print(
                 f'{part["part_index"]}: {part["name"]} | '
-                f'{part["note_count"]} notes | polyphony {part["max_polyphony"]}'
+                f'{part["note_count"]} notes | '
+                f'polyphony {part["max_polyphony"]}'
             )

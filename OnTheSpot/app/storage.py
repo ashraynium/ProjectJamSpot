@@ -3,7 +3,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from .midi_parser import MidiParser
 from .models import SongRecord
@@ -29,6 +29,7 @@ class JsonStore:
     def load(self):
         if not self.path.exists():
             return self.default.copy() if isinstance(self.default, dict) else list(self.default)
+
         try:
             with self.path.open("r", encoding="utf-8") as file:
                 return json.load(file)
@@ -37,8 +38,10 @@ class JsonStore:
 
     def save(self, data) -> None:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+
         with temporary.open("w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
+
         temporary.replace(self.path)
 
 
@@ -58,6 +61,7 @@ class SettingsStore:
     def record_session(self, seconds: float) -> None:
         if seconds < 1:
             return
+
         self.values["practice_seconds"] += float(seconds)
         self.values["sessions_completed"] += 1
         self.store.save(self.values)
@@ -68,8 +72,10 @@ class SongLibrary:
         self.data_directory = data_directory
         self.songs_directory = data_directory / "songs"
         self.songs_directory.mkdir(parents=True, exist_ok=True)
+
         self.store = JsonStore(data_directory / "library.json", [])
         self.records = []
+
         for item in self.store.load():
             try:
                 self.records.append(SongRecord.from_dict(item))
@@ -81,13 +87,16 @@ class SongLibrary:
 
     def import_song(self, source_path: str) -> SongRecord:
         source = Path(source_path)
+
         if source.suffix.lower() not in {".mid", ".midi"}:
             raise ValueError("JamSpot can only import .mid or .midi files.")
 
         parser = MidiParser(str(source)).parse()
+
         song_id = uuid.uuid4().hex[:10]
         destination_name = f"{song_id}_{safe_filename(source.name)}"
         destination = self.songs_directory / destination_name
+
         shutil.copy2(source, destination)
 
         record = SongRecord(
@@ -102,8 +111,10 @@ class SongLibrary:
             part_count=len(parser.parts_summary),
             imported_at=datetime.now(timezone.utc).isoformat(),
         )
+
         self.records.append(record)
         self._save()
+
         return record
 
     def path_for(self, record: SongRecord) -> Path:
@@ -114,6 +125,7 @@ class SongLibrary:
 
     def sorted_records(self, query: str = "") -> List[SongRecord]:
         query = query.strip().lower()
+
         records = [
             record
             for record in self.records
@@ -121,6 +133,7 @@ class SongLibrary:
             or query in record.title.lower()
             or query in record.original_filename.lower()
         ]
+
         return sorted(
             records,
             key=lambda record: (record.favourite, record.last_played, record.imported_at),
@@ -129,22 +142,28 @@ class SongLibrary:
 
     def toggle_favourite(self, song_id: str) -> None:
         record = self.get(song_id)
+
         if record:
             record.favourite = not record.favourite
             self._save()
 
     def mark_played(self, song_id: str) -> None:
         record = self.get(song_id)
+
         if record:
             record.last_played = datetime.now(timezone.utc).isoformat()
             self._save()
 
     def delete(self, song_id: str) -> None:
         record = self.get(song_id)
+
         if not record:
             return
+
         path = self.path_for(record)
+
         if path.exists():
             path.unlink()
+
         self.records = [item for item in self.records if item.song_id != song_id]
         self._save()
